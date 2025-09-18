@@ -1,0 +1,3 @@
+idempotencyKey,amount,account,type
+1,170,1,"credit"
+2,50,1,"debit"
