@@ -1,5 +1,10 @@
 import { Router, Request, Response } from 'express';
 import Account from '../models/account';
+import { createClient } from 'redis';
+
+// Initialize Redis client
+const redisClient = createClient();
+redisClient.connect().catch(console.error);
 /**
  * @openapi
  * /account/new-account:
@@ -54,21 +59,19 @@ routerAccount.post('/new-account', async (req: Request, res: Response) => {
     }
 });
 
-routerAccount.post('/get', async (req: Request, res: Response) => {
+routerAccount.get('/get', async (req: Request, res: Response) => {
     /**
      * @openapi
      * /account/get:
-     *   post:
+     *   get:
      *     summary: Get account by account number
-     *     requestBody:
-     *       required: true
-     *       content:
-     *         application/json:
-     *           schema:
-     *             type: object
-     *             properties:
-     *               accountNumber:
-     *                 type: number
+     *     parameters:
+     *       - in: query
+     *         name: accountNumber
+     *         required: true
+     *         schema:
+     *           type: number
+     *         description: Account number to retrieve
      *     responses:
      *       200:
      *         description: Account found
@@ -77,34 +80,56 @@ routerAccount.post('/get', async (req: Request, res: Response) => {
      *       404:
      *         description: Account not found
      */
-    const { accountNumber } = req.body;
-    if (!accountNumber) {
-        return res.status(400).json({ error: 'accountNumber is required' });
+    try {
+        const { accountNumber } = req.query;
+        if (!accountNumber) {
+            return res.status(400).json({ error: 'accountNumber is required as query parameter' });
+        }
+
+        // Check cache first
+        const cacheKey = `account:${accountNumber}`;
+        const cached = await redisClient.get(cacheKey);
+        if (cached) {
+            const cachedStr = typeof cached === 'string' ? cached : cached.toString();
+            return res.status(200).json({ account: JSON.parse(cachedStr), cached: true });
+        }
+
+        const account = await Account.findOne({ accountNumber: Number(accountNumber) });
+        if (!account) {
+            return res.status(404).json({ error: 'Account not found' });
+        }
+
+        const populatedAccount = await account.populate('investor');
+
+        // Cache the result for 1 hour
+        await redisClient.set(cacheKey, JSON.stringify(populatedAccount), { EX: 3600 });
+
+        res.status(200).json({ account: populatedAccount });
+    } catch (err) {
+        console.log(err);
+        res.status(500).json({ error: 'Failed to retrieve account' });
     }
-    const account = await Account.findOne({ accountNumber: accountNumber });
-    if (!account) {
-        return res.status(404).json({ error: 'Account not found' });
-    }
-    res.status(200).json({ account: await account.populate('investor') });
 });
 
-routerAccount.post('/delete', async (req: Request, res: Response) => {
+routerAccount.delete('/delete', async (req: Request, res: Response) => {
     /**
      * @openapi
      * /account/delete:
-     *   post:
+     *   delete:
      *     summary: Delete account by ID or account number
-     *     requestBody:
-     *       required: true
-     *       content:
-     *         application/json:
-     *           schema:
-     *             type: object
-     *             properties:
-     *               accountId:
-     *                 type: string
-     *               accountNumber:
-     *                 type: number
+     *     parameters:
+     *       - in: query
+     *         name: accountId
+     *         required: false
+     *         schema:
+     *           type: string
+     *         description: Account ID to delete
+     *       - in: query
+     *         name: accountNumber
+     *         required: false
+     *         schema:
+     *           type: number
+     *         description: Account number to delete
      *     responses:
      *       200:
      *         description: Account deleted successfully
@@ -115,24 +140,28 @@ routerAccount.post('/delete', async (req: Request, res: Response) => {
      *       500:
      *         description: Failed to delete account
      */
-    const { accountId, accountNumber } = req.body;
+    const { accountId, accountNumber } = req.query;
     if (!accountId && !accountNumber) {
-        return res.status(400).json({ error: 'accountId or accountNumber is required' });
+        return res.status(400).json({ error: 'accountId or accountNumber is required as query parameter' });
     }
     try {
-        // Match if either accountId or accountNumber is provided
-        const query: any = {};
-        if (accountId) query._id = accountId;
-        if (accountNumber) query.accountNumber = accountNumber;
-        const account = await Account.findOneAndDelete({
+        // Find the account first to get accountNumber for cache invalidation
+        const account = await Account.findOne({
             $or: [
                 accountId ? { _id: accountId } : {},
-                accountNumber ? { accountNumber: accountNumber } : {}
+                accountNumber ? { accountNumber: Number(accountNumber) } : {}
             ]
         });
         if (!account) {
             return res.status(404).json({ error: 'Account not found' });
         }
+
+        // Delete the account
+        await account.deleteOne();
+
+        // Invalidate cache
+        await redisClient.del(`account:${account.accountNumber}`);
+
         res.status(200).json({ message: 'Account deleted successfully' });
     } catch (err) {
         console.log(err);
@@ -189,6 +218,10 @@ routerAccount.put('/update', async (req: Request, res: Response) => {
         }
         account.set(updateData);
         await account.save();
+
+        // Invalidate cache
+        await redisClient.del(`account:${account.accountNumber}`);
+
         res.status(200).json({ message: 'Account updated successfully', account });
     } catch (err) {
         console.log(err);

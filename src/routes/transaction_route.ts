@@ -46,6 +46,21 @@ redisClient.connect().catch(console.error);
 transactionRouter.post('/new', async (req: Request, res: Response) => {
     try {
         const transactionData = req.body;
+
+        // Check if idempotencyKey is provided
+        if (!transactionData.idempotencyKey) {
+            return res.status(400).json({ error: 'idempotencyKey is required' });
+        }
+
+        // Check if transaction with same idempotencyKey already exists
+        const existingTransaction = await Transaction.findOne({ idempotencyKey: transactionData.idempotencyKey });
+        if (existingTransaction) {
+            return res.status(409).json({
+                error: 'Transaction with this idempotencyKey already exists',
+                existingTransaction: existingTransaction
+            });
+        }
+
         const acc = await Account.findOne({ accountNumber: transactionData.accountNumber });
         if (!acc) {
             return res.status(404).json({ error: 'Account not found' });
@@ -56,10 +71,15 @@ transactionRouter.post('/new', async (req: Request, res: Response) => {
         const newTransaction = new Transaction(transactionData);
         await newTransaction.save();
         if (transactionData.type === 'debit') {
-            await Account.findByIdAndUpdate(transactionData.account, { $inc: { money: -transactionData.amount } });
+            acc.money -= transactionData.amount;
         } else if (transactionData.type === 'credit') {
-            await Account.findByIdAndUpdate(transactionData.account, { $inc: { money: transactionData.amount } });
+            acc.money += transactionData.amount;
         }
+        await acc.save();
+
+        // Invalidate account cache as balance changed
+        await redisClient.del(`account:${transactionData.accountNumber}`);
+
         res.status(201).json({ message: 'Transaction added successfully', transaction: newTransaction });
     } catch (err) {
         console.log(err);
@@ -95,16 +115,7 @@ transactionRouter.post('/new-bulk', upload.single('file'), async (req: Request, 
     if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded' });
     }
-    // Use a hash of the file buffer as cache key
-    const crypto = await import('crypto');
-    const fileHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
-    const cacheKey = `bulk_upload:${fileHash}`;
-    // Check cache
-    const cached = await redisClient.get(cacheKey);
-    if (cached) {
-        const cachedStr = typeof cached === 'string' ? cached : cached.toString();
-        return res.status(200).json(JSON.parse(cachedStr));
-    }
+
     const results: any[] = [];
     const stream = Readable.from(req.file.buffer);
     stream.pipe(csvParser())
@@ -112,39 +123,80 @@ transactionRouter.post('/new-bulk', upload.single('file'), async (req: Request, 
         .on('end', async () => {
             try {
                 const inserted = [];
+                const skipped = [];
+                const failed = [];
+                const processedIdempotencyKeys = new Set<string>();
+
                 for (const row of results) {
-                    if (!row.amount || !row.account || !row.type) continue;
+                    if (!row.amount || !row.account || !row.type || !row.idempotencyKey) {
+                        failed.push({ row, reason: 'Missing required fields' });
+                        continue;
+                    }
+
+                    const idempotencyKey = row.idempotencyKey.toString();
+
+                    // Check if idempotencyKey already exists in database
+                    const existingTransaction = await Transaction.findOne({ idempotencyKey });
+                    if (existingTransaction) {
+                        skipped.push({ row, reason: 'IdempotencyKey already exists in database', existingTransaction });
+                        continue;
+                    }
+
+                    // Check if idempotencyKey is duplicate within current batch
+                    if (processedIdempotencyKeys.has(idempotencyKey)) {
+                        skipped.push({ row, reason: 'Duplicate idempotencyKey in current batch' });
+                        continue;
+                    }
+
+                    processedIdempotencyKeys.add(idempotencyKey);
+
                     const transaction = new Transaction({
-                        idempotencyKey: row.idempotencyKey.toString(),
+                        idempotencyKey,
                         amount: Number(row.amount),
                         accountNumber: Number(row.account),
                         type: row.type.toString()
                     });
+
                     const acc = await Account.findOne({ accountNumber: transaction.accountNumber });
                     if (!acc) {
-                        continue; // Skip if account doesn't exist
+                        failed.push({ row, reason: 'Account not found' });
+                        continue;
                     }
-                    if (transaction.type === 'debit' && acc.money > transaction.amount) {
-                        acc.money -= transaction.amount;
 
+                    if (transaction.type === 'debit' && acc.money < transaction.amount) {
+                        failed.push({ row, reason: 'Insufficient funds' });
+                        continue;
+                    }
+
+                    if (transaction.type === 'debit') {
+                        acc.money -= transaction.amount;
                     } else if (transaction.type === 'credit') {
                         acc.money += transaction.amount;
-                    } else {
-                        continue; // Skip if insufficient funds for debit
                     }
 
                     try {
                         await transaction.save();
+                        await acc.save();
                         inserted.push(transaction);
+                        // Invalidate account cache as balance changed
+                        await redisClient.del(`account:${transaction.accountNumber}`);
                     } catch (err) {
-                        console.log('Failed to save transaction:', row);
+                        console.log('Failed to save transaction:', row, err);
+                        failed.push({ row, reason: 'Database save error', error: err });
                         continue;
                     }
-                    await acc.save();
                 }
-                const response = { message: 'Transactions added', count: inserted.length };
-                // Cache the result for 1 hour
-                await redisClient.set(cacheKey, JSON.stringify(response), { EX: 3600 });
+                const response = {
+                    message: 'Bulk transaction processing completed',
+                    inserted: inserted.length,
+                    skipped: skipped.length,
+                    failed: failed.length,
+                    details: {
+                        skippedTransactions: skipped,
+                        failedTransactions: failed
+                    }
+                };
+
                 res.status(201).json(response);
             } catch (err) {
                 console.log(err);
@@ -156,21 +208,19 @@ transactionRouter.post('/new-bulk', upload.single('file'), async (req: Request, 
         });
 });
 
-transactionRouter.post('/get', async (req: Request, res: Response) => {
+transactionRouter.get('/get', async (req: Request, res: Response) => {
     /**
      * @openapi
      * /transaction/get:
-     *   post:
+     *   get:
      *     summary: Get transaction by ID
-     *     requestBody:
-     *       required: true
-     *       content:
-     *         application/json:
-     *           schema:
-     *             type: object
-     *             properties:
-     *               transactionId:
-     *                 type: string
+     *     parameters:
+     *       - in: query
+     *         name: transactionId
+     *         required: true
+     *         schema:
+     *           type: string
+     *         description: Transaction ID to retrieve
      *     responses:
      *       200:
      *         description: Transaction found
@@ -178,23 +228,43 @@ transactionRouter.post('/get', async (req: Request, res: Response) => {
      *         description: transactionId is required
      *       404:
      *         description: Transaction not found
+     *       500:
+     *         description: Failed to retrieve transaction
      */
-    const { transactionId } = req.body;
-    if (!transactionId) {
-        return res.status(400).json({ error: 'transactionId is required' });
+    try {
+        const { transactionId } = req.query;
+        if (!transactionId) {
+            return res.status(400).json({ error: 'transactionId is required as query parameter' });
+        }
+
+        // Check cache first
+        const cacheKey = `transaction:${transactionId}`;
+        const cached = await redisClient.get(cacheKey);
+        if (cached) {
+            const cachedStr = typeof cached === 'string' ? cached : cached.toString();
+            return res.status(200).json({ transaction: JSON.parse(cachedStr), cached: true });
+        }
+
+        const transaction = await Transaction.findById(transactionId);
+        if (!transaction) {
+            return res.status(404).json({ error: 'Transaction not found' });
+        }
+
+        // Cache the result for 1 hour
+        await redisClient.set(cacheKey, JSON.stringify(transaction), { EX: 3600 });
+
+        res.status(200).json({ transaction });
+    } catch (err) {
+        console.log(err);
+        res.status(500).json({ error: 'Failed to retrieve transaction' });
     }
-    const transaction = await Transaction.findById(transactionId);
-    if (!transaction) {
-        return res.status(404).json({ error: 'Transaction not found' });
-    }
-    res.status(200).json({ transaction });
 });
 
-transactionRouter.post('/reverse', async (req: Request, res: Response) => {
+transactionRouter.put('/reverse', async (req: Request, res: Response) => {
     /**
      * @openapi
      * /transaction/reverse:
-     *   post:
+     *   put:
      *     summary: Reverse a transaction
      *     requestBody:
      *       required: true
@@ -212,28 +282,46 @@ transactionRouter.post('/reverse', async (req: Request, res: Response) => {
      *         description: transactionId is required
      *       404:
      *         description: Transaction not found
+     *       500:
+     *         description: Failed to reverse transaction
      */
-    const { transactionId } = req.body;
-    if (!transactionId) {
-        return res.status(400).json({ error: 'transactionId is required' });
+    try {
+        const { transactionId } = req.body;
+        if (!transactionId) {
+            return res.status(400).json({ error: 'transactionId is required' });
+        }
+        const transaction = await Transaction.findById(transactionId);
+        if (!transaction) {
+            return res.status(404).json({ error: 'Transaction not found' });
+        }
+        // Generate a unique idempotencyKey for the reverse transaction
+        const reverseIdempotencyKey = `reverse_${transaction.idempotencyKey}_${Date.now()}`;
+
+        // Reverse the transaction
+        const reverseTransaction = new Transaction({
+            idempotencyKey: reverseIdempotencyKey,
+            amount: transaction.amount,
+            accountNumber: transaction.accountNumber,
+            type: transaction.type === 'credit' ? 'debit' : 'credit'
+        });
+        await reverseTransaction.save();
+
+        if (reverseTransaction.type === 'debit') {
+            await Account.findOneAndUpdate({ accountNumber: reverseTransaction.accountNumber }, { $inc: { money: -reverseTransaction.amount } });
+        } else if (reverseTransaction.type === 'credit') {
+            await Account.findOneAndUpdate({ accountNumber: reverseTransaction.accountNumber }, { $inc: { money: reverseTransaction.amount } });
+        }
+
+        // Invalidate cache for the original transaction
+        await redisClient.del(`transaction:${transactionId}`);
+        // Invalidate account cache as balance changed
+        await redisClient.del(`account:${transaction.accountNumber}`);
+
+        res.status(201).json({ message: 'Transaction reversed successfully', transaction: reverseTransaction });
+    } catch (err) {
+        console.log(err);
+        res.status(500).json({ error: 'Failed to reverse transaction' });
     }
-    const transaction = await Transaction.findById(transactionId);
-    if (!transaction) {
-        return res.status(404).json({ error: 'Transaction not found' });
-    }
-    // Reverse the transaction
-    const reverseTransaction = new Transaction({
-        amount: transaction.amount,
-        accountNumber: transaction.accountNumber,
-        type: transaction.type === 'credit' ? 'debit' : 'credit'
-    });
-    await reverseTransaction.save();
-    if (reverseTransaction.type === 'debit') {
-        await Account.findOneAndUpdate({ accountNumber: reverseTransaction.accountNumber }, { $inc: { money: -reverseTransaction.amount } });
-    } else if (reverseTransaction.type === 'credit') {
-        await Account.findOneAndUpdate({ accountNumber: reverseTransaction.accountNumber }, { $inc: { money: reverseTransaction.amount } });
-    }
-    res.status(201).json({ message: 'Transaction reversed successfully', transaction: reverseTransaction });
 });
 
 export default transactionRouter;

@@ -1,6 +1,11 @@
 import { Router, Request, Response } from 'express';
 import Investor from '../models/investor';
 import Account from '../models/account';
+import { createClient } from 'redis';
+
+// Initialize Redis client
+const redisClient = createClient();
+redisClient.connect().catch(console.error);
 
 const router_investor = Router();
 /**
@@ -46,7 +51,7 @@ router_investor.post('/create', async (req: Request, res: Response) => {
     }
 });
 
-router_investor.post('/retrieve', async (req: Request, res: Response) => {
+router_investor.get('/retrieve', async (req: Request, res: Response) => {
     /**
      * @openapi
      * /investor/retrieve:
@@ -70,11 +75,27 @@ router_investor.post('/retrieve', async (req: Request, res: Response) => {
      *         description: Failed to retrieve investor
      */
     try {
-        const { nic } = req.body;
+        const { nic } = req.query;
+        if (!nic) {
+            return res.status(400).json({ error: 'nic is required as query parameter' });
+        }
+
+        // Check cache first
+        const cacheKey = `investor:${nic}`;
+        const cached = await redisClient.get(cacheKey);
+        if (cached) {
+            const cachedStr = typeof cached === 'string' ? cached : cached.toString();
+            return res.status(200).json({ investor: JSON.parse(cachedStr), cached: true });
+        }
+
         const investor = await Investor.findOne({ nic });
         if (!investor) {
             return res.status(404).json({ error: 'Investor not found' });
         }
+
+        // Cache the result for 1 hour
+        await redisClient.set(cacheKey, JSON.stringify(investor), { EX: 3600 });
+
         res.status(200).json({ investor });
     } catch (err) {
         console.log(err);
@@ -82,7 +103,7 @@ router_investor.post('/retrieve', async (req: Request, res: Response) => {
     }
 });
 
-router_investor.post('/delete', async (req: Request, res: Response) => {
+router_investor.delete('/delete', async (req: Request, res: Response) => {
     /**
      * @openapi
      * /investor/delete:
@@ -110,9 +131,9 @@ router_investor.post('/delete', async (req: Request, res: Response) => {
      *         description: Failed to delete investor
      */
     try {
-        const { investorId, nic } = req.body;
+        const { investorId, nic } = req.query;
         if (!investorId && !nic) {
-            return res.status(400).json({ error: 'investorId or nic is required' });
+            return res.status(400).json({ error: 'investorId or nic is required as query parameter' });
         }
         // Find the investor
         const investor = await Investor.findOne({
@@ -127,6 +148,10 @@ router_investor.post('/delete', async (req: Request, res: Response) => {
         await Account.deleteMany({ investor: investor._id });
         // Delete the investor
         await investor.deleteOne();
+
+        // Invalidate cache
+        await redisClient.del(`investor:${investor.nic}`);
+
         res.status(200).json({ message: 'Investor and associated accounts deleted successfully' });
     } catch (err) {
         console.log(err);
@@ -138,7 +163,7 @@ router_investor.post('/delete', async (req: Request, res: Response) => {
 /**
  * @openapi
  * /investor/update:
- *   post:
+ *   put:
  *     summary: Update investor info
  *     requestBody:
  *       required: true
@@ -167,7 +192,7 @@ router_investor.post('/delete', async (req: Request, res: Response) => {
  *       500:
  *         description: Failed to update investor
  */
-router_investor.post('/update', async (req: Request, res: Response) => {
+router_investor.put('/update', async (req: Request, res: Response) => {
     try {
         const { investorId, nic, ...updateData } = req.body;
         if (!investorId && !nic) {
@@ -185,6 +210,10 @@ router_investor.post('/update', async (req: Request, res: Response) => {
         }
         investor.set(updateData);
         await investor.save();
+
+        // Invalidate cache
+        await redisClient.del(`investor:${investor.nic}`);
+
         res.status(200).json({ message: 'Investor updated successfully', investor });
     } catch (err) {
         console.log(err);

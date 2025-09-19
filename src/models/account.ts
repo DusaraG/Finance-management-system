@@ -15,7 +15,7 @@ const accountSchema = new Schema<IAccount>({
                 const investorExists = await Investor.exists({ _id: value });
                 return !!investorExists;
             },
-            message: "❌ Investor ID does not exist",
+            message: "Investor ID does not exist",
         }
     }
 });

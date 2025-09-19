@@ -9,7 +9,7 @@ export interface ITransaction extends Document {
 }
 
 const transactionSchema = new Schema<ITransaction>({
-    idempotencyKey: { type: String, unique: true },
+    idempotencyKey: { type: String, unique: true, required: true },
     date: { type: Date, default: Date.now },
     amount: { type: Number, required: true },
     accountNumber: {
