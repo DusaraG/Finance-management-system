@@ -5,6 +5,7 @@ import { Readable } from 'stream';
 import Transaction from '../models/transaction';
 import Account from '../models/account';
 import { createClient } from 'redis';
+import Logger from '../utils/logger';
 
 /**
  * @openapi
@@ -41,48 +42,116 @@ const transactionRouter = Router();
 // Initialize Redis client
 const redisClient = createClient();
 
-redisClient.connect().catch(console.error);
+redisClient.connect().then(() => {
+    Logger.info('Redis client connected successfully for transactions');
+}).catch((err) => {
+    Logger.error('Failed to connect to Redis for transactions', err);
+});
 
 transactionRouter.post('/new', async (req: Request, res: Response) => {
+    const transactionId = req.body.idempotencyKey || `temp_${Date.now()}`;
+    Logger.info('Creating new transaction', {
+        transactionId,
+        accountNumber: req.body.accountNumber,
+        amount: req.body.amount,
+        type: req.body.type
+    });
+
     try {
         const transactionData = req.body;
 
         // Check if idempotencyKey is provided
         if (!transactionData.idempotencyKey) {
+            Logger.warn('Transaction creation failed - missing idempotencyKey', { transactionData });
             return res.status(400).json({ error: 'idempotencyKey is required' });
         }
 
         // Check if transaction with same idempotencyKey already exists
+        Logger.debug('Checking for existing transaction', { idempotencyKey: transactionData.idempotencyKey });
         const existingTransaction = await Transaction.findOne({ idempotencyKey: transactionData.idempotencyKey });
         if (existingTransaction) {
+            Logger.warn('Duplicate transaction attempt', {
+                idempotencyKey: transactionData.idempotencyKey,
+                existingTransactionId: existingTransaction._id
+            });
             return res.status(409).json({
                 error: 'Transaction with this idempotencyKey already exists',
                 existingTransaction: existingTransaction
             });
         }
 
+        Logger.debug('Looking up account', { accountNumber: transactionData.accountNumber });
         const acc = await Account.findOne({ accountNumber: transactionData.accountNumber });
         if (!acc) {
+            Logger.warn('Transaction failed - account not found', {
+                accountNumber: transactionData.accountNumber,
+                idempotencyKey: transactionData.idempotencyKey
+            });
             return res.status(404).json({ error: 'Account not found' });
         }
+
+        Logger.debug('Account found, checking balance', {
+            accountNumber: acc.accountNumber,
+            currentBalance: acc.money,
+            transactionAmount: transactionData.amount,
+            transactionType: transactionData.type
+        });
+
         if (transactionData.type === 'debit' && acc.money < transactionData.amount) {
+            Logger.warn('Transaction failed - insufficient funds', {
+                accountNumber: acc.accountNumber,
+                currentBalance: acc.money,
+                requestedAmount: transactionData.amount,
+                idempotencyKey: transactionData.idempotencyKey
+            });
             return res.status(400).json({ error: 'Insufficient funds' });
         }
+
         const newTransaction = new Transaction(transactionData);
+        Logger.debug('Saving new transaction', {
+            transactionId: newTransaction.idempotencyKey,
+            accountNumber: newTransaction.accountNumber
+        });
+
         await newTransaction.save();
+
+        const oldBalance = acc.money;
         if (transactionData.type === 'debit') {
             acc.money -= transactionData.amount;
         } else if (transactionData.type === 'credit') {
             acc.money += transactionData.amount;
         }
+
+        Logger.debug('Updating account balance', {
+            accountNumber: acc.accountNumber,
+            oldBalance,
+            newBalance: acc.money,
+            transactionAmount: transactionData.amount,
+            transactionType: transactionData.type
+        });
+
         await acc.save();
 
         // Invalidate account cache as balance changed
         await redisClient.del(`account:${transactionData.accountNumber}`);
+        Logger.debug('Cache invalidated for account', { accountNumber: transactionData.accountNumber });
+
+        Logger.info('Transaction created successfully', {
+            transactionId: newTransaction._id,
+            idempotencyKey: newTransaction.idempotencyKey,
+            accountNumber: newTransaction.accountNumber,
+            amount: newTransaction.amount,
+            type: newTransaction.type,
+            newAccountBalance: acc.money
+        });
 
         res.status(201).json({ message: 'Transaction added successfully', transaction: newTransaction });
     } catch (err) {
-        console.log(err);
+        Logger.error('Failed to create transaction', {
+            error: err,
+            requestBody: req.body,
+            idempotencyKey: req.body?.idempotencyKey
+        });
         res.status(500).json({ error: 'Failed to add transaction' });
     }
 });
